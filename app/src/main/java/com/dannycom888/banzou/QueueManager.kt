@@ -145,7 +145,7 @@ object QueueManager {
             })
         }
         try {
-            SongProcessor.process(
+            val result = SongProcessor.process(
                 context = context,
                 separator = separator,
                 item = entry.item,
@@ -157,6 +157,17 @@ object QueueManager {
                         })
                     }
                 },
+            )
+            // Register the transit copies so they can be cleaned up in one
+            // tap after the accompaniment has been exported to the Shield.
+            TransitRegistry.add(
+                context,
+                TransitRegistry.Record(
+                    sourceUri = entry.item.uri.toString(),
+                    sourceName = entry.item.name,
+                    accompanimentUri = result.uri.toString(),
+                    accompanimentName = Naming.accompanimentName(entry.item.name),
+                ),
             )
             _state.update { old ->
                 old.copy(entries = old.entries.map {

@@ -37,8 +37,8 @@ android {
         applicationId = "com.dannycom888.banzou"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
 
         // Note10+ (the target device) is arm64-v8a; keep the APK lean.
         ndk {

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
@@ -30,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -79,8 +81,37 @@ fun BanzouApp() {
     var query by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
     var playingItem by remember { mutableStateOf<SongItem?>(null) }
+    var transitRecords by remember { mutableStateOf<List<TransitRegistry.Record>>(emptyList()) }
+    var showCleanupConfirm by remember { mutableStateOf(false) }
 
     val queueState by QueueManager.state.collectAsState()
+
+    fun refreshTransit() {
+        transitRecords = TransitRegistry.cleanable(context, prefs.getString(KEY_TREE_URI, null))
+    }
+
+    fun shareAccompaniments(items: List<SongItem>) {
+        val uris = items.mapNotNull { item ->
+            item.parent.findFile(Naming.accompanimentName(item.name))?.uri
+        }
+        if (uris.isEmpty()) {
+            Toast.makeText(context, "找不到伴奏文件", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = if (uris.size == 1) {
+            Intent(Intent.ACTION_SEND).apply {
+                type = "audio/mpeg"
+                putExtra(Intent.EXTRA_STREAM, uris[0])
+            }
+        } else {
+            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = "audio/mpeg"
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+            }
+        }
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        context.startActivity(Intent.createChooser(intent, "把伴奏发送到…"))
+    }
 
     fun rescan(treeUri: String) {
         scanning = true
@@ -121,12 +152,14 @@ fun BanzouApp() {
     ) { /* progress still visible in-app either way */ }
 
     LaunchedEffect(Unit) {
+        refreshTransit()
         prefs.getString(KEY_TREE_URI, null)?.let { rescan(it) }
     }
 
     // Refresh the list when songs finish (accompaniment marks change).
     val doneCount = queueState.doneCount
     LaunchedEffect(doneCount) {
+        refreshTransit()
         if (doneCount > 0) {
             prefs.getString(KEY_TREE_URI, null)?.let { uri ->
                 scope.launch {
@@ -199,8 +232,96 @@ fun BanzouApp() {
                 onCancel = { QueueManager.cancelAll() },
                 onRetry = { QueueManager.retryFailed(context) },
                 onPlay = { entry -> playingItem = entry.item },
+                onShare = { entry -> shareAccompaniments(listOf(entry.item)) },
+                onShareAll = {
+                    shareAccompaniments(
+                        queueState.entries.filter { it.status == EntryStatus.DONE }.map { it.item },
+                    )
+                },
             )
             Spacer(Modifier.height(8.dp))
+        }
+
+        if (transitRecords.isNotEmpty()) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text("中转清理", fontWeight = FontWeight.Bold)
+                    Text(
+                        "手机只是加工台：伴奏导出到 Shield 硬盘后，可一键删掉本 App 处理过的" +
+                            "中转副本（源文件副本 + 伴奏副本），腾出手机空间。原始歌库不在清理范围内。",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    OutlinedButton(onClick = { showCleanupConfirm = true }) {
+                        Text("一键清理中转副本（${transitRecords.size} 首）…")
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        if (showCleanupConfirm) {
+            val folderLabel = folderName ?: "所选文件夹"
+            AlertDialog(
+                onDismissRequest = { showCleanupConfirm = false },
+                title = { Text("确认删除中转副本") },
+                text = {
+                    Column {
+                        Text(
+                            "将删除以下 ${transitRecords.size * 2} 个文件，全部位于中转文件夹" +
+                                "「$folderLabel」内（路径：${prefs.getString(KEY_TREE_URI, "")}）：",
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        transitRecords.forEach { r ->
+                            Text("· ${r.sourceName}", style = MaterialTheme.typography.bodySmall)
+                            Text("· ${r.accompanimentName}", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "⚠ 请先确认伴奏已经导出到 Shield 硬盘。删除后无法恢复。" +
+                                "你车上听的原始歌库（Music）不在这个文件夹里，不会被碰。",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        showCleanupConfirm = false
+                        val records = transitRecords
+                        scope.launch {
+                            var deleted = 0
+                            var failed = 0
+                            withContext(Dispatchers.IO) {
+                                for (r in records) {
+                                    for (uriString in listOf(r.accompanimentUri, r.sourceUri)) {
+                                        val doc = DocumentFile.fromSingleUri(
+                                            context, Uri.parse(uriString),
+                                        )
+                                        val ok = try {
+                                            doc != null && (!doc.exists() || doc.delete())
+                                        } catch (e: Exception) {
+                                            false
+                                        }
+                                        if (ok) deleted++ else failed++
+                                    }
+                                }
+                            }
+                            TransitRegistry.remove(context, records)
+                            refreshTransit()
+                            prefs.getString(KEY_TREE_URI, null)?.let { rescan(it) }
+                            Toast.makeText(
+                                context,
+                                if (failed == 0) "已删除 $deleted 个中转副本"
+                                else "删除了 $deleted 个，$failed 个没删掉（可能已被移动）",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }) { Text("删除这 ${transitRecords.size * 2} 个文件") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showCleanupConfirm = false }) { Text("取消") }
+                },
+            )
         }
 
         playingItem?.let { item ->
@@ -259,6 +380,8 @@ fun QueuePanel(
     onCancel: () -> Unit,
     onRetry: () -> Unit,
     onPlay: (QueueEntry) -> Unit,
+    onShare: (QueueEntry) -> Unit,
+    onShareAll: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
@@ -293,6 +416,7 @@ fun QueuePanel(
                     }
                     if (entry.status == EntryStatus.DONE) {
                         OutlinedButton(onClick = { onPlay(entry) }) { Text("试听") }
+                        OutlinedButton(onClick = { onShare(entry) }) { Text("导出") }
                     }
                 }
                 if (entry.status == EntryStatus.RUNNING) {
@@ -301,6 +425,9 @@ fun QueuePanel(
             }
             Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (state.doneCount > 0) {
+                    Button(onClick = onShareAll) { Text("导出全部伴奏（${state.doneCount}）") }
+                }
                 if (state.running) {
                     OutlinedButton(onClick = onCancel) { Text("取消全部") }
                 }
